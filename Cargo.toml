@@ -1,6 +1,6 @@
 [package]
 name = "proc-macro2"
-version = "1.0.19" # remember to update html_root_url
+version = "1.0.24" # remember to update html_root_url
 authors = ["Alex Crichton <alex@alexcrichton.com>", "David Tolnay <dtolnay@gmail.com>"]
 license = "MIT OR Apache-2.0"
 readme = "README.md"
@@ -40,7 +40,7 @@ span-locations = []
 nightly = []
 
 [workspace]
-members = ["benches/bench-libproc-macro"]
+members = ["benches/bench-libproc-macro", "tests/ui"]
 
 [patch.crates-io]
 # Our doc tests depend on quote which depends on proc-macro2. Without this line,
