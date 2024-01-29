@@ -1,12 +1,15 @@
 use crate::detection::inside_proc_macro;
+#[cfg(span_locations)]
+use crate::location::LineColumn;
 use crate::{fallback, Delimiter, Punct, Spacing, TokenTree};
-use std::fmt::{self, Debug, Display};
-use std::iter::FromIterator;
-use std::ops::RangeBounds;
+use core::fmt::{self, Debug, Display};
+#[cfg(span_locations)]
+use core::ops::Range;
+use core::ops::RangeBounds;
+use core::str::FromStr;
 use std::panic;
 #[cfg(super_unstable)]
 use std::path::PathBuf;
-use std::str::FromStr;
 
 #[derive(Clone)]
 pub(crate) enum TokenStream {
@@ -27,10 +30,23 @@ pub(crate) struct DeferredTokenStream {
 pub(crate) enum LexError {
     Compiler(proc_macro::LexError),
     Fallback(fallback::LexError),
+
+    // Rustc was supposed to return a LexError, but it panicked instead.
+    // https://github.com/rust-lang/rust/issues/58736
+    CompilerPanic,
 }
 
-fn mismatch() -> ! {
-    panic!("stable/nightly mismatch")
+#[cold]
+fn mismatch(line: u32) -> ! {
+    #[cfg(procmacro2_backtrace)]
+    {
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        panic!("compiler/fallback mismatch #{}\n\n{}", line, backtrace)
+    }
+    #[cfg(not(procmacro2_backtrace))]
+    {
+        panic!("compiler/fallback mismatch #{}", line)
+    }
 }
 
 impl DeferredTokenStream {
@@ -61,7 +77,7 @@ impl DeferredTokenStream {
 }
 
 impl TokenStream {
-    pub fn new() -> TokenStream {
+    pub fn new() -> Self {
         if inside_proc_macro() {
             TokenStream::Compiler(DeferredTokenStream::new(proc_macro::TokenStream::new()))
         } else {
@@ -79,13 +95,13 @@ impl TokenStream {
     fn unwrap_nightly(self) -> proc_macro::TokenStream {
         match self {
             TokenStream::Compiler(s) => s.into_token_stream(),
-            TokenStream::Fallback(_) => mismatch(),
+            TokenStream::Fallback(_) => mismatch(line!()),
         }
     }
 
     fn unwrap_stable(self) -> fallback::TokenStream {
         match self {
-            TokenStream::Compiler(_) => mismatch(),
+            TokenStream::Compiler(_) => mismatch(line!()),
             TokenStream::Fallback(s) => s,
         }
     }
@@ -107,8 +123,8 @@ impl FromStr for TokenStream {
 
 // Work around https://github.com/rust-lang/rust/issues/58736.
 fn proc_macro_parse(src: &str) -> Result<proc_macro::TokenStream, LexError> {
-    panic::catch_unwind(|| src.parse().map_err(LexError::Compiler))
-        .unwrap_or(Err(LexError::Fallback(fallback::LexError)))
+    let result = panic::catch_unwind(|| src.parse().map_err(LexError::Compiler));
+    result.unwrap_or_else(|_| Err(LexError::CompilerPanic))
 }
 
 impl Display for TokenStream {
@@ -121,13 +137,13 @@ impl Display for TokenStream {
 }
 
 impl From<proc_macro::TokenStream> for TokenStream {
-    fn from(inner: proc_macro::TokenStream) -> TokenStream {
+    fn from(inner: proc_macro::TokenStream) -> Self {
         TokenStream::Compiler(DeferredTokenStream::new(inner))
     }
 }
 
 impl From<TokenStream> for proc_macro::TokenStream {
-    fn from(inner: TokenStream) -> proc_macro::TokenStream {
+    fn from(inner: TokenStream) -> Self {
         match inner {
             TokenStream::Compiler(inner) => inner.into_token_stream(),
             TokenStream::Fallback(inner) => inner.to_string().parse().unwrap(),
@@ -136,7 +152,7 @@ impl From<TokenStream> for proc_macro::TokenStream {
 }
 
 impl From<fallback::TokenStream> for TokenStream {
-    fn from(inner: fallback::TokenStream) -> TokenStream {
+    fn from(inner: fallback::TokenStream) -> Self {
         TokenStream::Fallback(inner)
     }
 }
@@ -160,7 +176,7 @@ fn into_compiler_token(token: TokenTree) -> proc_macro::TokenTree {
 }
 
 impl From<TokenTree> for TokenStream {
-    fn from(token: TokenTree) -> TokenStream {
+    fn from(token: TokenTree) -> Self {
         if inside_proc_macro() {
             TokenStream::Compiler(DeferredTokenStream::new(into_compiler_token(token).into()))
         } else {
@@ -189,14 +205,14 @@ impl FromIterator<TokenStream> for TokenStream {
                 first.evaluate_now();
                 first.stream.extend(streams.map(|s| match s {
                     TokenStream::Compiler(s) => s.into_token_stream(),
-                    TokenStream::Fallback(_) => mismatch(),
+                    TokenStream::Fallback(_) => mismatch(line!()),
                 }));
                 TokenStream::Compiler(first)
             }
             Some(TokenStream::Fallback(mut first)) => {
                 first.extend(streams.map(|s| match s {
                     TokenStream::Fallback(s) => s,
-                    TokenStream::Compiler(_) => mismatch(),
+                    TokenStream::Compiler(_) => mismatch(line!()),
                 }));
                 TokenStream::Fallback(first)
             }
@@ -243,14 +259,23 @@ impl Debug for TokenStream {
     }
 }
 
+impl LexError {
+    pub(crate) fn span(&self) -> Span {
+        match self {
+            LexError::Compiler(_) | LexError::CompilerPanic => Span::call_site(),
+            LexError::Fallback(e) => Span::Fallback(e.span()),
+        }
+    }
+}
+
 impl From<proc_macro::LexError> for LexError {
-    fn from(e: proc_macro::LexError) -> LexError {
+    fn from(e: proc_macro::LexError) -> Self {
         LexError::Compiler(e)
     }
 }
 
 impl From<fallback::LexError> for LexError {
-    fn from(e: fallback::LexError) -> LexError {
+    fn from(e: fallback::LexError) -> Self {
         LexError::Fallback(e)
     }
 }
@@ -260,6 +285,10 @@ impl Debug for LexError {
         match self {
             LexError::Compiler(e) => Debug::fmt(e, f),
             LexError::Fallback(e) => Debug::fmt(e, f),
+            LexError::CompilerPanic => {
+                let fallback = fallback::LexError::call_site();
+                Debug::fmt(&fallback, f)
+            }
         }
     }
 }
@@ -267,11 +296,12 @@ impl Debug for LexError {
 impl Display for LexError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            #[cfg(lexerror_display)]
             LexError::Compiler(e) => Display::fmt(e, f),
-            #[cfg(not(lexerror_display))]
-            LexError::Compiler(_e) => Display::fmt(&fallback::LexError, f),
             LexError::Fallback(e) => Display::fmt(e, f),
+            LexError::CompilerPanic => {
+                let fallback = fallback::LexError::call_site();
+                Display::fmt(&fallback, f)
+            }
         }
     }
 }
@@ -328,12 +358,6 @@ impl Iterator for TokenTreeIter {
     }
 }
 
-impl Debug for TokenTreeIter {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_struct("TokenTreeIter").finish()
-    }
-}
-
 #[derive(Clone, PartialEq, Eq)]
 #[cfg(super_unstable)]
 pub(crate) enum SourceFile {
@@ -373,12 +397,6 @@ impl Debug for SourceFile {
     }
 }
 
-#[cfg(any(super_unstable, feature = "span-locations"))]
-pub(crate) struct LineColumn {
-    pub line: usize,
-    pub column: usize,
-}
-
 #[derive(Copy, Clone)]
 pub(crate) enum Span {
     Compiler(proc_macro::Span),
@@ -386,7 +404,7 @@ pub(crate) enum Span {
 }
 
 impl Span {
-    pub fn call_site() -> Span {
+    pub fn call_site() -> Self {
         if inside_proc_macro() {
             Span::Compiler(proc_macro::Span::call_site())
         } else {
@@ -394,8 +412,7 @@ impl Span {
         }
     }
 
-    #[cfg(hygiene)]
-    pub fn mixed_site() -> Span {
+    pub fn mixed_site() -> Self {
         if inside_proc_macro() {
             Span::Compiler(proc_macro::Span::mixed_site())
         } else {
@@ -404,7 +421,7 @@ impl Span {
     }
 
     #[cfg(super_unstable)]
-    pub fn def_site() -> Span {
+    pub fn def_site() -> Self {
         if inside_proc_macro() {
             Span::Compiler(proc_macro::Span::def_site())
         } else {
@@ -414,29 +431,19 @@ impl Span {
 
     pub fn resolved_at(&self, other: Span) -> Span {
         match (self, other) {
-            #[cfg(hygiene)]
             (Span::Compiler(a), Span::Compiler(b)) => Span::Compiler(a.resolved_at(b)),
-
-            // Name resolution affects semantics, but location is only cosmetic
-            #[cfg(not(hygiene))]
-            (Span::Compiler(_), Span::Compiler(_)) => other,
-
             (Span::Fallback(a), Span::Fallback(b)) => Span::Fallback(a.resolved_at(b)),
-            _ => mismatch(),
+            (Span::Compiler(_), Span::Fallback(_)) => mismatch(line!()),
+            (Span::Fallback(_), Span::Compiler(_)) => mismatch(line!()),
         }
     }
 
     pub fn located_at(&self, other: Span) -> Span {
         match (self, other) {
-            #[cfg(hygiene)]
             (Span::Compiler(a), Span::Compiler(b)) => Span::Compiler(a.located_at(b)),
-
-            // Name resolution affects semantics, but location is only cosmetic
-            #[cfg(not(hygiene))]
-            (Span::Compiler(_), Span::Compiler(_)) => *self,
-
             (Span::Fallback(a), Span::Fallback(b)) => Span::Fallback(a.located_at(b)),
-            _ => mismatch(),
+            (Span::Compiler(_), Span::Fallback(_)) => mismatch(line!()),
+            (Span::Fallback(_), Span::Compiler(_)) => mismatch(line!()),
         }
     }
 
@@ -455,37 +462,30 @@ impl Span {
         }
     }
 
-    #[cfg(any(super_unstable, feature = "span-locations"))]
-    pub fn start(&self) -> LineColumn {
+    #[cfg(span_locations)]
+    pub fn byte_range(&self) -> Range<usize> {
         match self {
             #[cfg(proc_macro_span)]
-            Span::Compiler(s) => {
-                let proc_macro::LineColumn { line, column } = s.start();
-                LineColumn { line, column }
-            }
+            Span::Compiler(s) => s.byte_range(),
             #[cfg(not(proc_macro_span))]
-            Span::Compiler(_) => LineColumn { line: 0, column: 0 },
-            Span::Fallback(s) => {
-                let fallback::LineColumn { line, column } = s.start();
-                LineColumn { line, column }
-            }
+            Span::Compiler(_) => 0..0,
+            Span::Fallback(s) => s.byte_range(),
         }
     }
 
-    #[cfg(any(super_unstable, feature = "span-locations"))]
+    #[cfg(span_locations)]
+    pub fn start(&self) -> LineColumn {
+        match self {
+            Span::Compiler(_) => LineColumn { line: 0, column: 0 },
+            Span::Fallback(s) => s.start(),
+        }
+    }
+
+    #[cfg(span_locations)]
     pub fn end(&self) -> LineColumn {
         match self {
-            #[cfg(proc_macro_span)]
-            Span::Compiler(s) => {
-                let proc_macro::LineColumn { line, column } = s.end();
-                LineColumn { line, column }
-            }
-            #[cfg(not(proc_macro_span))]
             Span::Compiler(_) => LineColumn { line: 0, column: 0 },
-            Span::Fallback(s) => {
-                let fallback::LineColumn { line, column } = s.end();
-                LineColumn { line, column }
-            }
+            Span::Fallback(s) => s.end(),
         }
     }
 
@@ -508,22 +508,32 @@ impl Span {
         }
     }
 
+    pub fn source_text(&self) -> Option<String> {
+        match self {
+            #[cfg(not(no_source_text))]
+            Span::Compiler(s) => s.source_text(),
+            #[cfg(no_source_text)]
+            Span::Compiler(_) => None,
+            Span::Fallback(s) => s.source_text(),
+        }
+    }
+
     fn unwrap_nightly(self) -> proc_macro::Span {
         match self {
             Span::Compiler(s) => s,
-            Span::Fallback(_) => mismatch(),
+            Span::Fallback(_) => mismatch(line!()),
         }
     }
 }
 
 impl From<proc_macro::Span> for crate::Span {
-    fn from(proc_span: proc_macro::Span) -> crate::Span {
+    fn from(proc_span: proc_macro::Span) -> Self {
         crate::Span::_new(Span::Compiler(proc_span))
     }
 }
 
 impl From<fallback::Span> for Span {
-    fn from(inner: fallback::Span) -> Span {
+    fn from(inner: fallback::Span) -> Self {
         Span::Fallback(inner)
     }
 }
@@ -553,7 +563,7 @@ pub(crate) enum Group {
 }
 
 impl Group {
-    pub fn new(delimiter: Delimiter, stream: TokenStream) -> Group {
+    pub fn new(delimiter: Delimiter, stream: TokenStream) -> Self {
         match stream {
             TokenStream::Compiler(tts) => {
                 let delimiter = match delimiter {
@@ -598,20 +608,14 @@ impl Group {
 
     pub fn span_open(&self) -> Span {
         match self {
-            #[cfg(proc_macro_span)]
             Group::Compiler(g) => Span::Compiler(g.span_open()),
-            #[cfg(not(proc_macro_span))]
-            Group::Compiler(g) => Span::Compiler(g.span()),
             Group::Fallback(g) => Span::Fallback(g.span_open()),
         }
     }
 
     pub fn span_close(&self) -> Span {
         match self {
-            #[cfg(proc_macro_span)]
             Group::Compiler(g) => Span::Compiler(g.span_close()),
-            #[cfg(not(proc_macro_span))]
-            Group::Compiler(g) => Span::Compiler(g.span()),
             Group::Fallback(g) => Span::Fallback(g.span_close()),
         }
     }
@@ -620,14 +624,15 @@ impl Group {
         match (self, span) {
             (Group::Compiler(g), Span::Compiler(s)) => g.set_span(s),
             (Group::Fallback(g), Span::Fallback(s)) => g.set_span(s),
-            _ => mismatch(),
+            (Group::Compiler(_), Span::Fallback(_)) => mismatch(line!()),
+            (Group::Fallback(_), Span::Compiler(_)) => mismatch(line!()),
         }
     }
 
     fn unwrap_nightly(self) -> proc_macro::Group {
         match self {
             Group::Compiler(g) => g,
-            Group::Fallback(_) => mismatch(),
+            Group::Fallback(_) => mismatch(line!()),
         }
     }
 }
@@ -663,28 +668,28 @@ pub(crate) enum Ident {
 }
 
 impl Ident {
-    pub fn new(string: &str, span: Span) -> Ident {
+    #[track_caller]
+    pub fn new_checked(string: &str, span: Span) -> Self {
         match span {
             Span::Compiler(s) => Ident::Compiler(proc_macro::Ident::new(string, s)),
-            Span::Fallback(s) => Ident::Fallback(fallback::Ident::new(string, s)),
+            Span::Fallback(s) => Ident::Fallback(fallback::Ident::new_checked(string, s)),
         }
     }
 
-    pub fn new_raw(string: &str, span: Span) -> Ident {
+    pub fn new_unchecked(string: &str, span: fallback::Span) -> Self {
+        Ident::Fallback(fallback::Ident::new_unchecked(string, span))
+    }
+
+    #[track_caller]
+    pub fn new_raw_checked(string: &str, span: Span) -> Self {
         match span {
-            Span::Compiler(s) => {
-                let p: proc_macro::TokenStream = string.parse().unwrap();
-                let ident = match p.into_iter().next() {
-                    Some(proc_macro::TokenTree::Ident(mut i)) => {
-                        i.set_span(s);
-                        i
-                    }
-                    _ => panic!(),
-                };
-                Ident::Compiler(ident)
-            }
-            Span::Fallback(s) => Ident::Fallback(fallback::Ident::new_raw(string, s)),
+            Span::Compiler(s) => Ident::Compiler(proc_macro::Ident::new_raw(string, s)),
+            Span::Fallback(s) => Ident::Fallback(fallback::Ident::new_raw_checked(string, s)),
         }
+    }
+
+    pub fn new_raw_unchecked(string: &str, span: fallback::Span) -> Self {
+        Ident::Fallback(fallback::Ident::new_raw_unchecked(string, span))
     }
 
     pub fn span(&self) -> Span {
@@ -698,14 +703,15 @@ impl Ident {
         match (self, span) {
             (Ident::Compiler(t), Span::Compiler(s)) => t.set_span(s),
             (Ident::Fallback(t), Span::Fallback(s)) => t.set_span(s),
-            _ => mismatch(),
+            (Ident::Compiler(_), Span::Fallback(_)) => mismatch(line!()),
+            (Ident::Fallback(_), Span::Compiler(_)) => mismatch(line!()),
         }
     }
 
     fn unwrap_nightly(self) -> proc_macro::Ident {
         match self {
             Ident::Compiler(s) => s,
-            Ident::Fallback(_) => mismatch(),
+            Ident::Fallback(_) => mismatch(line!()),
         }
     }
 }
@@ -715,7 +721,8 @@ impl PartialEq for Ident {
         match (self, other) {
             (Ident::Compiler(t), Ident::Compiler(o)) => t.to_string() == o.to_string(),
             (Ident::Fallback(t), Ident::Fallback(o)) => t == o,
-            _ => mismatch(),
+            (Ident::Compiler(_), Ident::Fallback(_)) => mismatch(line!()),
+            (Ident::Fallback(_), Ident::Compiler(_)) => mismatch(line!()),
         }
     }
 }
@@ -782,6 +789,14 @@ macro_rules! unsuffixed_integers {
 }
 
 impl Literal {
+    pub unsafe fn from_str_unchecked(repr: &str) -> Self {
+        if inside_proc_macro() {
+            Literal::Compiler(proc_macro::Literal::from_str(repr).expect("invalid literal"))
+        } else {
+            Literal::Fallback(unsafe { fallback::Literal::from_str_unchecked(repr) })
+        }
+    }
+
     suffixed_numbers! {
         u8_suffixed => u8,
         u16_suffixed => u16,
@@ -866,7 +881,8 @@ impl Literal {
         match (self, span) {
             (Literal::Compiler(lit), Span::Compiler(s)) => lit.set_span(s),
             (Literal::Fallback(lit), Span::Fallback(s)) => lit.set_span(s),
-            _ => mismatch(),
+            (Literal::Compiler(_), Span::Fallback(_)) => mismatch(line!()),
+            (Literal::Fallback(_), Span::Compiler(_)) => mismatch(line!()),
         }
     }
 
@@ -883,14 +899,28 @@ impl Literal {
     fn unwrap_nightly(self) -> proc_macro::Literal {
         match self {
             Literal::Compiler(s) => s,
-            Literal::Fallback(_) => mismatch(),
+            Literal::Fallback(_) => mismatch(line!()),
         }
     }
 }
 
 impl From<fallback::Literal> for Literal {
-    fn from(s: fallback::Literal) -> Literal {
+    fn from(s: fallback::Literal) -> Self {
         Literal::Fallback(s)
+    }
+}
+
+impl FromStr for Literal {
+    type Err = LexError;
+
+    fn from_str(repr: &str) -> Result<Self, Self::Err> {
+        if inside_proc_macro() {
+            let literal = proc_macro::Literal::from_str(repr)?;
+            Ok(Literal::Compiler(literal))
+        } else {
+            let literal = fallback::Literal::from_str(repr)?;
+            Ok(Literal::Fallback(literal))
+        }
     }
 }
 
@@ -909,5 +939,16 @@ impl Debug for Literal {
             Literal::Compiler(t) => Debug::fmt(t, f),
             Literal::Fallback(t) => Debug::fmt(t, f),
         }
+    }
+}
+
+#[cfg(span_locations)]
+pub(crate) fn invalidate_current_thread_spans() {
+    if inside_proc_macro() {
+        panic!(
+            "proc_macro2::extra::invalidate_current_thread_spans is not available in procedural macros"
+        );
+    } else {
+        crate::fallback::invalidate_current_thread_spans();
     }
 }
