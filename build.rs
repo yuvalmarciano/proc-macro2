@@ -44,7 +44,7 @@ use std::u32;
 fn main() {
     let rustc = rustc_minor_version().unwrap_or(u32::MAX);
 
-    let semver_exempt = true
+    let semver_exempt = true;
     if semver_exempt {
         // https://github.com/dtolnay/proc-macro2/issues/147
         println!("cargo:rustc-cfg=procmacro2_semver_exempt");
